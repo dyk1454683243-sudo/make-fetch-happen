@@ -758,6 +758,59 @@ t.test('empty GET bodies without content-length are stored', async (t) => {
   t.ok(srv.isDone())
 })
 
+t.test('uncacheable responses are skipped', async (t) => {
+  const srv = nock(HOST)
+    .get('/nostore')
+    .reply(200, CONTENT, {
+      ...getHeaders(CONTENT),
+      'cache-control': 'no-store',
+    })
+    .get('/notfound')
+    .reply(404, 'missing', {
+      'cache-control': 'max-age=300',
+    })
+
+  const dir = t.testdir()
+  const noStore = await fetch(`${HOST}/nostore`, { cachePath: dir })
+  t.equal(noStore.headers.get('x-local-cache-status'), 'skip',
+    'no-store responses are not written')
+  await noStore.buffer()
+
+  const notFound = await fetch(`${HOST}/notfound`, { cachePath: dir })
+  t.equal(notFound.headers.get('x-local-cache-status'), 'skip',
+    'non-cacheable statuses are not written')
+  await notFound.buffer()
+  t.ok(srv.isDone())
+})
+
+t.test('GET does not reuse a metadata-only 200 cache entry', async (t) => {
+  const dir = t.testdir()
+  const reqKey = cacheKey(new Request(`${HOST}/test`))
+  await cacache.index.insert(dir, reqKey, null, {
+    metadata: {
+      time: Date.now(),
+      url: `${HOST}/test`,
+      status: 200,
+      reqHeaders: {},
+      resHeaders: {
+        'cache-control': 'max-age=300',
+        date: new Date().toISOString(),
+      },
+      options: { compress: true },
+    },
+  })
+
+  const srv = nock(HOST)
+    .get('/test')
+    .reply(200, CONTENT, getHeaders(CONTENT))
+
+  const res = await fetch(`${HOST}/test`, { cachePath: dir })
+  t.equal(res.headers.get('x-local-cache-status'), 'miss',
+    'null-integrity 200 entries do not satisfy GET')
+  t.same(await res.buffer(), CONTENT, 'GET fetched the real body')
+  t.ok(srv.isDone())
+})
+
 t.test('HEAD redirects are stored', async (t) => {
   const srv = nock(HOST)
     .head('/redir')
