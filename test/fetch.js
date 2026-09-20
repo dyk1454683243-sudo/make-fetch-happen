@@ -671,6 +671,59 @@ t.test('retries non-POST requests on timeouts', async (t) => {
     )
     t.ok(srv.isDone())
   })
+
+  t.test('catches minipass-fetch timeout rejections and retries', async (t) => {
+    const unhandled = []
+    const onUnhandled = (reason) => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    t.teardown(() => {
+      process.off('unhandledRejection', onUnhandled)
+    })
+
+    const minipassFetch = require('minipass-fetch')
+    let calls = 0
+    const mockedFetch = t.mock('../lib/index.js', {
+      'minipass-fetch': Object.assign((url) => {
+        calls++
+        if (calls === 1) {
+          const err = new minipassFetch.FetchError(
+            `network timeout at: ${HOST}/timeout-reject`,
+            'request-timeout'
+          )
+          // Timeouts can surface with both a network code and request-timeout.
+          // That combination must still be retried, not thrown as unhandled.
+          err.code = 'ETIMEDOUT'
+          return Promise.reject(err)
+        }
+        // Request.timeout is copied from the original Request (timeout: 1).
+        // Retry with the URL string so minipass-fetch does not inherit that timer.
+        const retryUrl = typeof url === 'string' ? url : url.url
+        return minipassFetch(retryUrl)
+      }, minipassFetch),
+    })
+
+    const srv = nock(HOST)
+      .get('/timeout-reject')
+      .reply(200, CONTENT)
+
+    const res = await mockedFetch(`${HOST}/timeout-reject`, {
+      timeout: 1,
+      retry: {
+        retries: 1,
+        minTimeout: 1,
+      },
+    })
+    t.equal(calls, 2, 'retried after the mocked timeout rejection')
+    t.equal(res.status, 200, 'request succeeded after retry')
+    t.equal(res.headers.get('x-fetch-attempts'), '2', 'recorded the retry attempt')
+    const buf = await res.buffer()
+    t.same(buf, CONTENT, 'returned the successful response body')
+    await new Promise(resolve => setImmediate(resolve))
+    t.equal(unhandled.length, 0, 'did not emit unhandledRejection')
+    t.ok(srv.isDone())
+  })
 })
 
 t.test('retries non-POST requests on 500 errors', async (t) => {
