@@ -669,19 +669,129 @@ t.test('cached GET is used for HEAD', async (t) => {
   t.ok(res.headers.has('x-local-cache-time'))
 })
 
-t.test('HEAD requests are not stored', async (t) => {
+t.test('HEAD requests are stored', async (t) => {
   const srv = nock(HOST)
     .head('/test')
     .reply(200, undefined, getHeaders(CONTENT))
+    .get('/test')
+    .reply(200, CONTENT, getHeaders(CONTENT))
 
   const dir = t.testdir()
+  const reqKey = cacheKey(new Request(`${HOST}/test`))
   const res = await fetch(`${HOST}/test`, { method: 'HEAD', cachePath: dir })
   const buf = await res.buffer()
-  t.ok(srv.isDone())
   t.equal(res.status, 200, 'got a 200')
   t.equal(res.url, `${HOST}/test`, 'has the right url property')
   t.same(buf, Buffer.from([]), 'got no body')
-  t.equal(res.headers.get('x-local-cache-status'), 'skip', 'did not cache the response')
+  t.equal(res.headers.get('x-local-cache-status'), 'miss', 'wrote a cache entry')
+  t.equal(res.headers.get('x-local-cache'), encodeURIComponent(dir), 'encoded the path')
+  t.equal(res.headers.get('x-local-cache-key'), encodeURIComponent(reqKey),
+    'got the right cache key')
+  t.ok(res.headers.has('x-local-cache-time'))
+
+  const dirAfterRead = await readdir(dir)
+  t.ok(dirAfterRead.length > 0, 'cache has data after a HEAD response')
+
+  const cached = await fetch(`${HOST}/test`, { method: 'HEAD', cachePath: dir })
+  t.equal(cached.status, 200, 'got a 200 from cache')
+  t.same(await cached.buffer(), Buffer.from([]), 'cached HEAD has no body')
+  t.equal(cached.headers.get('x-local-cache-status'), 'hit', 'served HEAD from cache')
+  t.equal(cached.headers.get('cache-control'), 'max-age=300', 'kept cache-control')
+  t.equal(cached.headers.get('content-type'), 'application/octet-stream', 'kept content-type')
+
+  // HEAD 200 is metadata-only and must not be reused as a GET body
+  const getRes = await fetch(`${HOST}/test`, { cachePath: dir })
+  t.equal(getRes.headers.get('x-local-cache-status'), 'miss', 'GET after HEAD is a miss')
+  t.same(await getRes.buffer(), CONTENT, 'GET fetched the real body')
+
+  const cachedGet = await fetch(`${HOST}/test`, { cachePath: dir })
+  t.equal(cachedGet.headers.get('x-local-cache-status'), 'hit',
+    'GET body remains cached alongside the HEAD metadata entry')
+  t.same(await cachedGet.buffer(), CONTENT, 'got the original body')
+  t.ok(srv.isDone())
+})
+
+t.test('empty GET bodies are stored', async (t) => {
+  const empty = Buffer.alloc(0)
+  const srv = nock(HOST)
+    .get('/empty')
+    .reply(200, empty, getHeaders(empty))
+
+  const dir = t.testdir()
+  const reqKey = cacheKey(new Request(`${HOST}/empty`))
+  const res = await fetch(`${HOST}/empty`, { cachePath: dir })
+  t.equal(res.status, 200)
+  t.equal(res.headers.get('x-local-cache-status'), 'miss', 'wrote a cache entry')
+  t.same(await res.buffer(), empty, 'got an empty body')
+
+  const dirAfterRead = await readdir(dir)
+  t.ok(dirAfterRead.length > 0, 'cache has data after consuming the empty body')
+
+  const entries = await cacache.index.compact(dir, reqKey, () => false)
+  t.equal(entries.length, 1, 'should only have one entry')
+  t.equal(entries[0].integrity, ssri.fromData(empty).toString(), 'empty body has integrity')
+  t.equal(entries[0].size, 0, 'stored size is 0')
+
+  const cached = await fetch(`${HOST}/empty`, { cachePath: dir })
+  t.equal(cached.headers.get('x-local-cache-status'), 'hit', 'served empty GET from cache')
+  t.same(await cached.buffer(), empty, 'cached body is still empty')
+  t.ok(srv.isDone())
+})
+
+t.test('empty GET bodies without content-length are stored', async (t) => {
+  const srv = nock(HOST)
+    .get('/empty')
+    .reply(200, '', {
+      'cache-control': 'max-age=300',
+      'content-type': 'application/octet-stream',
+      date: new Date().toISOString(),
+    })
+
+  const dir = t.testdir()
+  const res = await fetch(`${HOST}/empty`, { cachePath: dir })
+  t.equal(res.headers.get('x-local-cache-status'), 'miss', 'wrote a cache entry')
+  t.same(await res.buffer(), Buffer.from(''), 'got an empty body')
+
+  const cached = await fetch(`${HOST}/empty`, { cachePath: dir })
+  t.equal(cached.headers.get('x-local-cache-status'), 'hit', 'served empty GET from cache')
+  t.same(await cached.buffer(), Buffer.from(''), 'cached body is still empty')
+  t.ok(srv.isDone())
+})
+
+t.test('HEAD redirects are stored', async (t) => {
+  const srv = nock(HOST)
+    .head('/redir')
+    .reply(301, undefined, {
+      location: `${HOST}/final`,
+      'cache-control': 'max-age=300',
+    })
+
+  const dir = t.testdir()
+  const res = await fetch(`${HOST}/redir`, {
+    method: 'HEAD',
+    cachePath: dir,
+    redirect: 'manual',
+  })
+  t.equal(res.status, 301)
+  t.equal(res.headers.get('x-local-cache-status'), 'miss', 'wrote a cache entry')
+  t.equal(res.headers.get('location'), `${HOST}/final`)
+  await res.buffer()
+
+  const cachedHead = await fetch(`${HOST}/redir`, {
+    method: 'HEAD',
+    cachePath: dir,
+    redirect: 'manual',
+  })
+  t.equal(cachedHead.status, 301)
+  t.equal(cachedHead.headers.get('x-local-cache-status'), 'hit', 'served HEAD redirect from cache')
+  t.equal(cachedHead.headers.get('location'), `${HOST}/final`)
+
+  const cachedGet = await fetch(`${HOST}/redir`, { cachePath: dir, redirect: 'manual' })
+  t.equal(cachedGet.status, 301)
+  t.equal(cachedGet.headers.get('x-local-cache-status'), 'hit',
+    'GET can reuse a cached HEAD redirect')
+  t.equal(cachedGet.headers.get('location'), `${HOST}/final`)
+  t.ok(srv.isDone())
 })
 
 t.test('caches resulting GET after initial redirect', async (t) => {
